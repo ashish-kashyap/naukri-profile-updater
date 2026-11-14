@@ -488,40 +488,104 @@ class NaukriUpdater:
             self._save_diagnostics(page, "email_field_not_found")
             return False
 
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(600)
 
-        # Password input
+        # --- Step A: Check if Naukri uses a 2-step flow (email → Continue → password) ---
+        # Some Naukri pages hide the password field until email is submitted.
+        pwd_loc = page.locator("input[type='password']").first
+        try:
+            pwd_visible = pwd_loc.is_visible(timeout=1500)
+        except Exception:
+            pwd_visible = False
+
+        if not pwd_visible:
+            # 2-step flow: click Continue/Next to reveal password field
+            log.info("Password field not visible — trying 2-step login (email → Continue → password)...")
+            try:
+                continue_btn = page.locator(
+                    "button:has-text('Continue'), button:has-text('Next'), "
+                    "button[type='submit']:not(:has-text('Login'))"
+                ).first
+                continue_btn.wait_for(state="visible", timeout=5_000)
+                continue_btn.click()
+                log.info("Clicked Continue button, waiting for password field...")
+                page.wait_for_timeout(2000)
+            except Exception as e:
+                log.debug(f"No separate Continue button found ({e}), trying Enter key...")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(2000)
+
+        # Now fill password (should be visible in both single and 2-step flows)
         try:
             pwd_loc = page.locator("input[type='password']").first
             pwd_loc.wait_for(state="visible", timeout=10_000)
             pwd_loc.click()
-            page.wait_for_timeout(300)
-            pwd_loc.fill(PASSWORD)
+            page.wait_for_timeout(400)
+            # Type character-by-character to mimic human input (avoids bot detection on fill())
+            pwd_loc.type(PASSWORD, delay=50)
+            log.info("Password filled successfully.")
         except Exception as e:
             log.error(f"Could not fill password: {e}")
             self._save_diagnostics(page, "password_field_error")
             return False
 
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(600)
+
+        # Capture page state before submitting so debug artifact is useful
+        self._save_diagnostics(page, "before_submit")
 
         log.info("Submitting login form...")
+
+        # Intercept the login API response so we know the server's answer
+        login_response_status = []
+        def _capture_response(resp):
+            if "login" in resp.url.lower() or "auth" in resp.url.lower():
+                login_response_status.append((resp.url, resp.status))
+        page.on("response", _capture_response)
+
         try:
-            btn_loc = page.locator("button[type='submit'], .loginButton, button:has-text('Login')").first
+            btn_loc = page.locator(
+                "button[type='submit'], .loginButton, button:has-text('Login'), button:has-text('Sign in')"
+            ).first
             btn_loc.wait_for(state="visible", timeout=10_000)
             btn_loc.click()
+            # Also press Enter as a fallback trigger (some SPAs need both)
+            page.wait_for_timeout(300)
         except Exception as e:
             log.error(f"Could not click login button: {e}")
             self._save_diagnostics(page, "login_btn_error")
             return False
 
+        # Wait briefly for any network response to come back
+        page.wait_for_timeout(2000)
+        if login_response_status:
+            for url, status in login_response_status:
+                log.info(f"Login API response: {url} → HTTP {status}")
+        else:
+            log.warning("No login API response captured — form may not have submitted (bot block or wrong button).")
+            # Fallback: press Enter directly on the password field
+            log.info("Trying Enter-key fallback submit...")
+            pwd_loc.press("Enter")
+            page.wait_for_timeout(2000)
+
         # Wait for post-login redirect OR OTP challenge
-        # Increased to 50s to allow time for OTP page redirect on foreign cloud IPs
         log.info("Waiting for login result (redirect or OTP challenge)...")
         start_wait = time.time()
         wait_limit = 50
+        last_snapshot_time = 0
         while time.time() - start_wait < wait_limit:
             current_url = page.url
-            log.debug(f"[login-wait] URL={current_url}")
+            elapsed = int(time.time() - start_wait)
+
+            # Log page title + first visible text every 10s so we know what's shown
+            if elapsed - last_snapshot_time >= 10:
+                try:
+                    title = page.title()
+                    snippet = page.inner_text("body")[:300].replace("\n", " ").strip()
+                    log.info(f"[login-wait {elapsed}s] URL={current_url} | Title={title!r} | Body={snippet!r}")
+                except Exception:
+                    log.info(f"[login-wait {elapsed}s] URL={current_url}")
+                last_snapshot_time = elapsed
 
             # 1. Success check: redirected to profile / home
             if "mnjuser" in current_url or (
