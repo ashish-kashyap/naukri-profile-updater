@@ -25,8 +25,6 @@ import random
 import logging
 import argparse
 import subprocess
-import imaplib
-import email
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,44 +53,11 @@ ACTION_DELAY_MS = int(os.getenv("ACTION_DELAY_MS", "1500"))
 HEADLINE_A = os.getenv("HEADLINE_VARIANT_A", "").strip()
 HEADLINE_B = os.getenv("HEADLINE_VARIANT_B", "").strip()
 RESUME_PATH_ENV = os.getenv("RESUME_PATH", "").strip().strip('"').strip("'")
-RESUME_BASE64_ENV = os.getenv("RESUME_BASE64", "").strip()
-
-# If running in cloud/CI with RESUME_BASE64 secret, decode to a local file
-if not RESUME_PATH_ENV and RESUME_BASE64_ENV:
-    import base64
-    resume_cloud_file = BASE_DIR / "resume_cloud.pdf"
-    try:
-        resume_cloud_file.write_bytes(base64.b64decode(RESUME_BASE64_ENV))
-        RESUME_PATH_ENV = str(resume_cloud_file)
-    except Exception as exc:
-        pass
-
-# Fallback: check if resume.pdf exists in the repository root (e.g. for private repos)
-if not RESUME_PATH_ENV:
-    for default_resume in [BASE_DIR / "resume.pdf", BASE_DIR / "resume.docx"]:
-        if default_resume.exists():
-            RESUME_PATH_ENV = str(default_resume)
-            break
 
 MAX_RETRIES_ENV = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY_SEC_ENV = int(os.getenv("RETRY_DELAY_SEC", "15"))
 RANDOM_JITTER_MAX_SEC = int(os.getenv("RANDOM_JITTER_MAX_SEC", "0"))
 SEND_NOTIFICATIONS = os.getenv("SEND_NOTIFICATIONS", "true").lower() == "true"
-
-# Automated Email OTP Reader settings (for foreign cloud runners / new location challenges)
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "").strip().replace(" ", "")
-EMAIL_USER = os.getenv("EMAIL_USER", "").strip() or EMAIL
-EMAIL_HOST = os.getenv("EMAIL_HOST", "").strip()
-
-if not EMAIL_HOST:
-    if "@gmail.com" in EMAIL_USER.lower():
-        EMAIL_HOST = "imap.gmail.com"
-    elif any(d in EMAIL_USER.lower() for d in ["@outlook.com", "@hotmail.com", "@live.com"]):
-        EMAIL_HOST = "outlook.office365.com"
-    elif "@yahoo.com" in EMAIL_USER.lower():
-        EMAIL_HOST = "imap.mail.yahoo.com"
-    else:
-        EMAIL_HOST = "imap.gmail.com"
 
 NAUKRI_LOGIN_URL = "https://www.naukri.com/nlogin/login"
 NAUKRI_PROFILE_URL = "https://www.naukri.com/mnjuser/profile"
@@ -126,7 +91,7 @@ log = logging.getLogger("naukri-updater")
 
 def send_windows_notification(title: str, message: str, is_error: bool = False):
     """Sends a native Windows Toast notification if enabled and not running in CI."""
-    if not SEND_NOTIFICATIONS or os.getenv("GITHUB_ACTIONS") == "true":
+    if not SEND_NOTIFICATIONS:
         return
     try:
         # Use PowerShell to trigger a modern Windows Notification toast
@@ -148,103 +113,6 @@ def send_windows_notification(title: str, message: str, is_error: bool = False):
         )
     except Exception:
         pass
-
-
-def write_github_summary(title: str, details: dict, success: bool):
-    """Appends Markdown job summary for GitHub Actions if running in CI."""
-    summary_file = os.getenv("GITHUB_STEP_SUMMARY")
-    if not summary_file:
-        return
-    try:
-        badge = "Status: **SUCCESS**" if success else "Status: **FAILED**"
-        lines = [
-            f"### {title} - {badge}\n",
-            "| Field | Detail |",
-            "|---|---|",
-        ]
-        for k, v in details.items():
-            lines.append(f"| {k} | {v} |")
-        lines.append(f"| Completed At | {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} |")
-        lines.append("")
-        with open(summary_file, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-    except Exception:
-        pass
-
-
-def fetch_naukri_otp(email_user: str, email_password: str, host: str, timeout_sec: int = 75) -> str | None:
-    """Connects to IMAP server and retrieves the latest 4-6 digit OTP sent by Naukri."""
-    log.info(f"Connecting to {host} as {email_user} to fetch Naukri OTP...")
-    start_time = time.time()
-
-    while time.time() - start_time < timeout_sec:
-        mail = None
-        try:
-            mail = imaplib.IMAP4_SSL(host)
-            mail.login(email_user, email_password)
-            mail.select("INBOX")
-
-            # Search recent emails
-            status, messages = mail.search(None, "ALL")
-            if status == "OK" and messages[0]:
-                msg_ids = messages[0].split()
-                # Examine the most recent 5 emails in reverse chronological order
-                for msg_id in reversed(msg_ids[-5:]):
-                    res, msg_data = mail.fetch(msg_id, "(RFC822)")
-                    for part in msg_data:
-                        if isinstance(part, tuple):
-                            msg = email.message_from_bytes(part[1])
-                            from_hdr = str(msg.get("From", "")).lower()
-                            subj_hdr = str(msg.get("Subject", "")).lower()
-
-                            # Check if email is from Naukri or mentions OTP / verification
-                            if "naukri" in from_hdr or "naukri" in subj_hdr or "otp" in subj_hdr or "verification" in subj_hdr:
-                                # Extract email body text
-                                body = ""
-                                if msg.is_multipart():
-                                    for p in msg.walk():
-                                        if p.get_content_type() in ["text/plain", "text/html"]:
-                                            payload = p.get_payload(decode=True)
-                                            if payload:
-                                                body += payload.decode(errors="ignore")
-                                else:
-                                    payload = msg.get_payload(decode=True)
-                                    if payload:
-                                        body = payload.decode(errors="ignore")
-
-                                # Search for OTP patterns: e.g. "OTP is 123456", "code is: 1234", "<b>123456</b>", or 6/4 digits
-                                patterns = [
-                                    r"(?:otp|verification code|code)\s*(?:is|:)?\s*<b>?(\d{4,6})</b>?",
-                                    r"<b>(\d{4,6})</b>",
-                                    r"\b(\d{6})\b",
-                                    r"\b(\d{4})\b",
-                                ]
-                                for pat in patterns:
-                                    matches = re.findall(pat, body, re.IGNORECASE)
-                                    if matches:
-                                        # Avoid matching current year like 2026
-                                        valid = [m for m in matches if m not in ["2024", "2025", "2026", "2027"]]
-                                        if valid:
-                                            otp = valid[0]
-                                            log.info(f"Successfully retrieved Naukri OTP from email: {otp}")
-                                            try:
-                                                mail.logout()
-                                            except Exception:
-                                                pass
-                                            return otp
-            mail.logout()
-        except Exception as e:
-            log.debug(f"IMAP check attempt notice: {e}")
-            if mail:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
-
-        time.sleep(4)
-
-    log.error(f"Timed out after {timeout_sec}s waiting for Naukri OTP email.")
-    return None
 
 
 def clean_old_artifacts(days: int = 14):
@@ -370,16 +238,13 @@ class NaukriUpdater:
                     "--start-maximized",
                 ])
 
-            # In GitHub Actions, Xvfb provides a virtual X11 display so we can
-            # run Chrome in headed mode (headless=False) everywhere — this is the
-            # only reliable way to avoid Naukri's Akamai CDN bot-detection.
-            is_ci = os.getenv("GITHUB_ACTIONS") == "true"
+            # Always run headed Chrome — Akamai CDN blocks headless-shell
             launch_kwargs = {
-                "headless": False,  # Always headed — Akamai blocks headless-shell
+                "headless": False,
                 "slow_mo": 50,
                 "args": browser_args,
             }
-            if channel and not is_ci:
+            if channel:
                 launch_kwargs["channel"] = channel
 
             browser = pw.chromium.launch(**launch_kwargs)
@@ -568,16 +433,16 @@ class NaukriUpdater:
             pwd_loc.press("Enter")
             page.wait_for_timeout(2000)
 
-        # Wait for post-login redirect OR OTP challenge
-        log.info("Waiting for login result (redirect or OTP challenge)...")
+        # Wait for post-login redirect
+        log.info("Waiting for login result...")
         start_wait = time.time()
-        wait_limit = 50
+        wait_limit = 30
         last_snapshot_time = 0
         while time.time() - start_wait < wait_limit:
             current_url = page.url
             elapsed = int(time.time() - start_wait)
 
-            # Log page title + first visible text every 10s so we know what's shown
+            # Log page title + first visible text every 10s for diagnostics
             if elapsed - last_snapshot_time >= 10:
                 try:
                     title = page.title()
@@ -587,55 +452,19 @@ class NaukriUpdater:
                     log.info(f"[login-wait {elapsed}s] URL={current_url}")
                 last_snapshot_time = elapsed
 
-            # 1. Success check: redirected to profile / home
+            # Success: redirected away from the login page
             if "mnjuser" in current_url or (
-                "naukri.com" in current_url
-                and "nlogin" not in current_url
-                and "otp" not in current_url.lower()
+                "naukri.com" in current_url and "nlogin" not in current_url
             ):
                 log.info("Login successful (redirected)!")
                 return True
 
-            # 2. URL-based OTP page detection (Naukri redirects to /nlogin/otp or similar)
-            if "otp" in current_url.lower() or "verify" in current_url.lower():
-                log.info(f"Detected OTP challenge page via URL: {current_url}")
-                return self._handle_otp_challenge(page)
-
-            # 3. Check for OTP inputs
-            otp_selectors = [
-                "input[placeholder*='OTP' i]",
-                "input[name*='otp' i]",
-                "input[id*='otp' i]",
-                "input[class*='otp' i]",
-                "input[maxlength='6']",
-                "input[maxlength='1']",
-            ]
-            for sel in otp_selectors:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=500):
-                        log.info(f"Detected OTP input field ({sel}).")
-                        return self._handle_otp_challenge(page)
-                except Exception:
-                    pass
-
-            # 4. Check for OTP text on page (broader match)
-            try:
-                page_text = page.inner_text("body")
-                otp_keywords = ["enter otp", "verification code", "verify with otp",
-                                "enter verification code", "otp sent", "one-time password"]
-                if any(kw in page_text.lower() for kw in otp_keywords):
-                    log.info("Detected OTP challenge text in page body.")
-                    return self._handle_otp_challenge(page)
-            except Exception:
-                pass
-
-            # 5. Check for credential errors
+            # Credential error shown on page
             try:
                 err_locs = page.locator(".server-err, .err, [class*='error-msg'], .login-error, .cntErr").all_inner_texts()
                 clean_errs = [e.strip() for e in err_locs if e.strip()]
                 if clean_errs:
-                    log.error(f"Login error displayed on page: {' | '.join(clean_errs)}")
+                    log.error(f"Login error on page: {' | '.join(clean_errs)}")
                     self._save_diagnostics(page, "login_error_text")
                     return False
             except Exception:
@@ -646,72 +475,6 @@ class NaukriUpdater:
         log.error(f"Login timed out after {wait_limit}s. Current URL: {page.url}")
         self._save_diagnostics(page, "login_failed")
         return False
-
-    def _handle_otp_challenge(self, page) -> bool:
-        """Automatically reads the OTP from email via IMAP and completes login."""
-        log.info("Naukri triggered an OTP verification challenge.")
-        if not EMAIL_APP_PASSWORD:
-            log.error(
-                "Naukri requires OTP verification, but EMAIL_APP_PASSWORD is not set in environment or GitHub Secrets! "
-                "Please configure EMAIL_APP_PASSWORD (e.g. 16-character Google App Password) to allow automatic OTP login."
-            )
-            self._save_diagnostics(page, "otp_prompt_no_password")
-            return False
-
-        log.info("Waiting for OTP email from Naukri and reading via IMAP...")
-        email_to_check = EMAIL_USER or EMAIL
-        otp_timeout = int(os.getenv("OTP_TIMEOUT_SEC", "120"))
-        otp_code = fetch_naukri_otp(email_to_check, EMAIL_APP_PASSWORD, EMAIL_HOST, timeout_sec=otp_timeout)
-
-        if not otp_code:
-            log.error("Could not fetch OTP from email.")
-            self._save_diagnostics(page, "otp_fetch_failed")
-            return False
-
-        log.info(f"Submitting OTP code ({otp_code}) into login form...")
-        try:
-            # Check for multi-input individual digit boxes (e.g. 6 separate boxes)
-            digit_inputs = page.locator("input[maxlength='1']")
-            if digit_inputs.count() >= len(otp_code):
-                log.info("Filling multi-box individual digit inputs...")
-                for idx, ch in enumerate(otp_code):
-                    digit_inputs.nth(idx).fill(ch)
-                    page.wait_for_timeout(100)
-            else:
-                # Single OTP input field
-                otp_field = page.locator(
-                    "input[placeholder*='OTP' i], input[name*='otp' i], input[id*='otp' i], input[class*='otp' i], input[maxlength='6'], input[type='tel'], input[type='number']"
-                ).first
-                otp_field.click()
-                page.wait_for_timeout(200)
-                otp_field.fill(otp_code)
-
-            page.wait_for_timeout(500)
-
-            # Click submit/verify button
-            verify_btn = page.locator(
-                "button:has-text('Verify'), button:has-text('Submit'), button[type='submit'], button:has-text('Continue'), .btn-dark-ot"
-            ).first
-            if verify_btn.is_visible(timeout=3000):
-                verify_btn.click()
-            else:
-                page.keyboard.press("Enter")
-
-            # Wait for redirect after OTP submission
-            page.wait_for_url("**/mnjuser/**", timeout=25_000)
-            log.info("OTP verification successful! Logged in.")
-            return True
-        except PlaywrightTimeoutError:
-            if "naukri.com" in page.url and "nlogin" not in page.url:
-                log.info("OTP verification successful (redirected)!")
-                return True
-            log.error(f"OTP verification failed or timed out. Current URL: {page.url}")
-            self._save_diagnostics(page, "otp_verification_failed")
-            return False
-        except Exception as e:
-            log.error(f"Failed to submit OTP: {e}")
-            self._save_diagnostics(page, "otp_submit_error")
-            return False
 
     # ------------------------------------------------------------------
     # Resume Upload Flow
@@ -918,15 +681,6 @@ def run_production(args) -> bool:
             title="Naukri Profile Updater",
             message="Your Naukri profile headline and timestamp were refreshed successfully!",
         )
-        write_github_summary(
-            "Naukri Profile Update",
-            {
-                "Mode": "DRY RUN" if args.dry_run else "LIVE",
-                "Resume Upload": "Skipped" if args.skip_resume or not updater.resume_path else "Uploaded",
-                "Headline Refresh": "Skipped" if args.skip_headline else "Updated & Saved",
-            },
-            success=True,
-        )
         return True
     else:
         log.error(f"All {max_retries} attempts failed. Please review the logs and screenshots above.")
@@ -934,15 +688,6 @@ def run_production(args) -> bool:
             title="Naukri Updater Alert",
             message=f"Profile update failed after {max_retries} attempts. Check screenshots/ and logs/ for details.",
             is_error=True,
-        )
-        write_github_summary(
-            "Naukri Profile Update",
-            {
-                "Mode": "DRY RUN" if args.dry_run else "LIVE",
-                "Attempts Made": f"{max_retries}",
-                "Error": "Check uploaded artifacts/logs for details",
-            },
-            success=False,
         )
         return False
 
