@@ -1,0 +1,20 @@
+# Credentials - NEVER commit these
+.env
+.state.json
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Playwright browsers
+playwright-browsers/
+
+# Screenshots (debug artifacts)
+screenshots/
