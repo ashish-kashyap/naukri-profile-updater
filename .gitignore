@@ -1,6 +1,7 @@
 # Credentials - NEVER commit these
 .env
 .state.json
+.browser-profile/
 
 # Logs
 logs/

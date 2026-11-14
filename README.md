@@ -8,9 +8,12 @@ Automatically refreshes your Naukri.com profile daily so you stay visible at the
 
 ### 1. Install Dependencies
 ```powershell
-pip install -r requirements.txt
-playwright install chromium
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
+
+Open this folder in VS Code and select `.venv\Scripts\python.exe` with **Python: Select Interpreter** if VS Code does not select it automatically. The workspace settings point Pylance at this environment so it can resolve `dotenv` and Playwright.
 
 ### 2. Configure Credentials
 ```powershell
@@ -25,32 +28,33 @@ RESUME_PATH="C:/Users/your_username/Documents/resume.pdf"
 
 ### 3. Test the Script
 ```powershell
-# Safe Dry Run: Browser opens, logs in, checks profile, but does NOT save
-python update_profile.py --dry-run --visible
+# First run: use a visible browser to sign in and complete any Naukri verification.
+# The isolated .browser-profile/ directory retains the session for later runs.
+./.venv/Scripts/python.exe update_profile.py --dry-run --visible
 
 # Live Run with Visible Browser: Watch the full automation work
-python update_profile.py --visible
+./.venv/Scripts/python.exe update_profile.py --visible
 
 # Silent / Production Run: Runs headless in the background
-python update_profile.py
+./.venv/Scripts/python.exe update_profile.py
 ```
 
 ### 4. Schedule Daily Runs (Windows Task Scheduler)
 ```powershell
 # Schedule at 09:00 AM daily
-python setup_scheduler.py
+./.venv/Scripts/python.exe setup_scheduler.py
 
 # Or choose a custom time (e.g. 08:30 AM)
-python setup_scheduler.py --time 08:30
+./.venv/Scripts/python.exe setup_scheduler.py --time 08:30
 
 # Check scheduled status, next run time, and last result:
-python setup_scheduler.py --status
+./.venv/Scripts/python.exe setup_scheduler.py --status
 
 # Trigger an immediate run via Task Scheduler:
-python setup_scheduler.py --run-now
+./.venv/Scripts/python.exe setup_scheduler.py --run-now
 
 # Remove the scheduled task anytime:
-python setup_scheduler.py --remove
+./.venv/Scripts/python.exe setup_scheduler.py --remove
 ```
 
 ---
@@ -62,11 +66,14 @@ python setup_scheduler.py --remove
   * **Headline Toggle:** Updates your Resume Headline (alternating between two custom variants or toggling a trailing dot) to refresh the *"Profile last updated"* timestamp.
 * **Production Reliability:**
   * **Automated Retries:** 3 automatic retry attempts with exponential backoff on transient network or CDN timeouts.
-  * **Anti-Bot & Stealth:** Uses invisible headed Chrome rendering and stealth techniques to prevent Akamai CDN "Access Denied" blocks.
+  * **Session Persistence:** Uses a dedicated browser profile so a user-completed sign-in can be reused across scheduled runs. If Naukri requests verification, complete it in a visible run; the script does not solve or bypass challenges.
+  * **Verified Updates:** Requires Naukri's resume success message and matching profile filename, and confirms the headline with Naukri's success message or a read-back before reporting success.
   * **Catch-up Scheduling:** Configured with Windows Task Scheduler `StartWhenAvailable` — if your PC was asleep or off at 9:00 AM, it runs automatically as soon as you wake it up.
   * **Battery Execution:** Configured to run on laptops even while unplugged.
   * **Windows Desktop Notifications:** Displays a native Windows notification banner upon successful update or failure.
   * **Storage Auto-cleanup:** Automatically purges screenshots and debug DOM snapshots older than 14 days.
+
+The `.browser-profile/` directory contains the updater's saved sign-in session. Keep it private and do not copy it to another machine. The first visible run may require a manual Naukri verification; fully unattended updates are possible only while Naukri accepts the saved session.
 
 ---
 
@@ -83,7 +90,7 @@ python setup_scheduler.py --remove
 | `ACTION_DELAY_MS` | `1500` | Delay between browser actions in milliseconds |
 | `MAX_RETRIES` | `3` | Maximum retry attempts per execution |
 | `RETRY_DELAY_SEC` | `15` | Seconds to wait between retries (doubles each attempt) |
-| `RANDOM_JITTER_MAX_SEC`| `0` | Anti-bot random wait window before starting |
+| `RANDOM_JITTER_MAX_SEC`| `0` | Maximum random startup delay in seconds |
 | `SEND_NOTIFICATIONS` | `true` | Windows desktop toast notifications on finish |
 
 ---
@@ -91,7 +98,7 @@ python setup_scheduler.py --remove
 ## CLI Options
 
 ```powershell
-python update_profile.py [OPTIONS]
+./.venv/Scripts/python.exe update_profile.py [OPTIONS]
 
 Options:
   --visible        Show the browser window (overrides HEADLESS=true)

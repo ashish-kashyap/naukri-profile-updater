@@ -52,7 +52,7 @@ def create_task(run_time: str):
     ps_script = f"""
     $Action = New-ScheduledTaskAction -Execute '{runner}' -Argument '"{script_path}"' -WorkingDirectory '{BASE_DIR}'
     $Trigger = New-ScheduledTaskTrigger -Daily -At '{run_time}'
-    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10) -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10) -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
     Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $Action -Trigger $Trigger -Settings $Settings -Force
     """
 

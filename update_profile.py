@@ -5,8 +5,8 @@ Automates daily updates on Naukri.com to keep your profile active at the top
 of recruiter searches:
   1. Optionally re-uploads your resume (refreshes "Resume updated" timestamp)
   2. Updates your Resume Headline (alternates between variants or toggles period)
-  3. Includes automated retries, Windows desktop notifications, old artifact cleanup,
-     and random jitter for anti-bot protection.
+  3. Includes retries, Windows desktop notifications, old artifact cleanup,
+     and optional startup jitter for scheduled runs.
 
 Usage:
     python update_profile.py                  # Normal production run (headless)
@@ -40,6 +40,7 @@ BASE_DIR = Path(__file__).parent.resolve()
 LOG_DIR = BASE_DIR / "logs"
 SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 STATE_FILE = BASE_DIR / ".state.json"
+PROFILE_DIR = BASE_DIR / ".browser-profile"
 
 LOG_DIR.mkdir(exist_ok=True)
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
@@ -61,11 +62,6 @@ SEND_NOTIFICATIONS = os.getenv("SEND_NOTIFICATIONS", "true").lower() == "true"
 
 NAUKRI_LOGIN_URL = "https://www.naukri.com/nlogin/login"
 NAUKRI_PROFILE_URL = "https://www.naukri.com/mnjuser/profile"
-CHROME_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
-)
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -172,8 +168,6 @@ def pick_headline(current_headline: str) -> str:
         log.warning(f"Headline length is {len(chosen)} chars, exceeding Naukri's 250-character limit! Truncating to 250 chars.")
         chosen = chosen[:250]
 
-    state["last_variant"] = "A" if use_variant_a else "B"
-    save_state(state)
     return chosen
 
 
@@ -190,10 +184,15 @@ class NaukriUpdater:
         self.skip_resume = skip_resume
         self.skip_headline = skip_headline
         self.resume_path = resume_path or RESUME_PATH_ENV
+        self.interactive_verification_required = False
+        self.stop_retries = False
+        self.resume_completed = False
+        self.headline_completed = False
 
     def execute_single_attempt(self, attempt_num: int = 1) -> bool:
         """Executes one end-to-end update attempt."""
         if not EMAIL or not PASSWORD:
+            self.stop_retries = True
             log.error(
                 "Credentials not found! Set NAUKRI_EMAIL and NAUKRI_PASSWORD in .env"
             )
@@ -202,7 +201,16 @@ class NaukriUpdater:
         if not self.skip_resume and self.resume_path:
             rf = Path(self.resume_path)
             if not rf.exists():
+                self.stop_retries = True
                 log.error(f"Configured resume file does not exist: {self.resume_path}")
+                return False
+            if rf.suffix.lower() not in {".pdf", ".doc", ".docx", ".rtf"}:
+                self.stop_retries = True
+                log.error("Resume must be a PDF, DOC, DOCX, or RTF file.")
+                return False
+            if rf.stat().st_size > 2 * 1024 * 1024:
+                self.stop_retries = True
+                log.error("Resume exceeds Naukri's 2 MB upload limit.")
                 return False
 
         log.info("=" * 60)
@@ -215,49 +223,26 @@ class NaukriUpdater:
 
         with sync_playwright() as pw:
             channel = get_browser_channel()
-            browser_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--no-first-run",
-            ]
+            browser_args = ["--window-size=1366,768"]
 
-            # Akamai CDN explicitly detects and blocks the stripped 'chrome-headless-shell' binary.
-            # To run invisibly in the background without triggering Akamai CDN bot detection,
-            # we run the full headed Chrome binary with the window positioned offscreen.
-            if self.headless:
-                browser_args.extend([
-                    "--window-position=-3200,-3200",
-                    "--window-size=1366,768",
-                ])
-            else:
-                browser_args.extend([
-                    "--window-size=1366,768",
-                    "--start-maximized",
-                ])
+            # Use the selected browser mode and keep the session profile isolated
+            # from the user's everyday Chrome profile.
+            if not self.headless:
+                browser_args.append("--start-maximized")
 
-            # Always run headed Chrome — Akamai CDN blocks headless-shell
             launch_kwargs = {
-                "headless": False,
-                "slow_mo": 50,
+                "headless": self.headless,
+                "slow_mo": 50 if not self.headless else 0,
                 "args": browser_args,
+                "viewport": {"width": 1366, "height": 768},
+                "locale": "en-IN",
+                "timezone_id": "Asia/Kolkata",
             }
             if channel:
                 launch_kwargs["channel"] = channel
 
-            browser = pw.chromium.launch(**launch_kwargs)
-            context = browser.new_context(
-                user_agent=CHROME_USER_AGENT,
-                viewport={"width": 1366, "height": 768},
-                locale="en-IN",
-                timezone_id="Asia/Kolkata",
-            )
-            # Mask webdriver property cleanly
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            """)
+            PROFILE_DIR.mkdir(exist_ok=True)
+            context = pw.chromium.launch_persistent_context(str(PROFILE_DIR), **launch_kwargs)
             page = context.new_page()
 
             page.on("pageerror", lambda err: log.warning(f"Browser JS error: {err}"))
@@ -272,24 +257,26 @@ class NaukriUpdater:
                 page.goto(NAUKRI_PROFILE_URL, wait_until="domcontentloaded", timeout=35_000)
                 page.wait_for_timeout(ACTION_DELAY_MS)
 
-                results = []
-
                 # Step 1: Upload resume (if configured and not skipped)
+                if not self.skip_resume and self.resume_path and not self.resume_completed:
+                    self.resume_completed = self._upload_resume(page)
+                if not self.skip_headline and not self.headline_completed:
+                    # Re-navigate after a resume upload; the page can display a
+                    # completion overlay or replace parts of the profile DOM.
+                    if self.resume_completed:
+                        page.goto(NAUKRI_PROFILE_URL, wait_until="domcontentloaded", timeout=35_000)
+                        page.wait_for_timeout(ACTION_DELAY_MS)
+                    self.headline_completed = self._update_headline(page)
+
+                requested = []
                 if not self.skip_resume and self.resume_path:
-                    resume_ok = self._upload_resume(page)
-                    results.append(resume_ok)
-                    # Re-navigate to profile for headline step
-                    page.goto(NAUKRI_PROFILE_URL, wait_until="domcontentloaded", timeout=35_000)
-                    page.wait_for_timeout(ACTION_DELAY_MS)
-
-                # Step 2: Update headline (if not skipped)
+                    requested.append(self.resume_completed)
                 if not self.skip_headline:
-                    headline_ok = self._update_headline(page)
-                    results.append(headline_ok)
+                    requested.append(self.headline_completed)
 
-                overall_success = all(results) if results else True
+                overall_success = bool(requested) and all(requested)
 
-                if overall_success:
+                if overall_success and not self.dry_run:
                     state = load_state()
                     state["last_run"] = datetime.now().isoformat()
                     state["last_status"] = "SUCCESS"
@@ -306,13 +293,24 @@ class NaukriUpdater:
                 self._save_diagnostics(page, f"error_attempt_{attempt_num}")
                 return False
             finally:
-                browser.close()
+                context.close()
 
     # ------------------------------------------------------------------
     # Login Flow
     # ------------------------------------------------------------------
 
     def _login(self, page) -> bool:
+        # Reuse the authenticated session retained by the persistent profile.
+        try:
+            page.goto(NAUKRI_PROFILE_URL, wait_until="domcontentloaded", timeout=35_000)
+            page.wait_for_timeout(ACTION_DELAY_MS)
+            if ("/mnjuser/" in page.url.lower()
+                    and page.locator("text=Resume headline").count() > 0):
+                log.info("Existing Naukri session is active; login skipped.")
+                return True
+        except PlaywrightTimeoutError:
+            log.warning("Could not reuse the saved session; attempting a fresh login.")
+
         log.info("Navigating to login page...")
         # Optional warm-up visit to home to obtain standard cookies
         try:
@@ -326,6 +324,7 @@ class NaukriUpdater:
 
         # Check for Access Denied CDN block
         if "Access Denied" in page.title() or "access denied" in page.content().lower():
+            self.stop_retries = True
             log.error("Access Denied by Naukri CDN. Try running with --visible flag to use headed mode.")
             self._save_diagnostics(page, "access_denied")
             return False
@@ -396,16 +395,13 @@ class NaukriUpdater:
 
         page.wait_for_timeout(600)
 
-        # Capture page state before submitting so debug artifact is useful
-        self._save_diagnostics(page, "before_submit")
-
         log.info("Submitting login form...")
 
         # Intercept the login API response so we know the server's answer
         login_response_status = []
         def _capture_response(resp):
-            if "login" in resp.url.lower() or "auth" in resp.url.lower():
-                login_response_status.append((resp.url, resp.status))
+            if "naukri.com/central-login-services/" in resp.url.lower():
+                login_response_status.append(resp.status)
         page.on("response", _capture_response)
 
         try:
@@ -424,14 +420,12 @@ class NaukriUpdater:
         # Wait briefly for any network response to come back
         page.wait_for_timeout(2000)
         if login_response_status:
-            for url, status in login_response_status:
-                log.info(f"Login API response: {url} → HTTP {status}")
+            for status in login_response_status:
+                log.info(f"Naukri login API response: HTTP {status}")
         else:
-            log.warning("No login API response captured — form may not have submitted (bot block or wrong button).")
-            # Fallback: press Enter directly on the password field
-            log.info("Trying Enter-key fallback submit...")
-            pwd_loc.press("Enter")
-            page.wait_for_timeout(2000)
+            # Endpoint names can change; do not submit a second time just
+            # because this listener did not observe the expected API route.
+            log.warning("No matching Naukri login API response captured; waiting for the page result.")
 
         # Wait for post-login redirect
         log.info("Waiting for login result...")
@@ -461,9 +455,52 @@ class NaukriUpdater:
 
             # Credential error shown on page
             try:
+                body_text = page.locator("body").inner_text(timeout=1500)
+                if re.search(r"captcha|select all images|which shape does this image|verify that you are human|security check", body_text, re.I):
+                    self.interactive_verification_required = True
+                    self._save_diagnostics(page, "verification_required")
+                    if self.headless:
+                        log.error("Naukri requires interactive verification. Rerun with --visible and complete the challenge manually.")
+                        return False
+
+                    log.warning("Naukri requires interactive verification. Complete it in the visible browser; waiting up to 3 minutes.")
+                    challenge_deadline = time.time() + 180
+                    login_resubmitted_after_challenge = False
+                    while time.time() < challenge_deadline:
+                        if "/mnjuser/" in page.url.lower() or (
+                            "naukri.com" in page.url.lower() and "nlogin" not in page.url.lower()
+                        ):
+                            log.info("Login succeeded after manual verification.")
+                            return True
+
+                        try:
+                            challenge_text = page.locator("body").inner_text(timeout=1500)
+                        except Exception:
+                            page.wait_for_timeout(1000)
+                            continue
+
+                        if (not login_resubmitted_after_challenge and
+                                not re.search(r"captcha|select all images|which shape does this image|verify that you are human|security check", challenge_text, re.I)):
+                            # Some challenge flows return to the login form after
+                            # verification and require one final explicit submit.
+                            try:
+                                submit = page.locator(
+                                    "button[type='submit'], .loginButton, button:has-text('Login'), button:has-text('Sign in')"
+                                ).first
+                                if submit.is_visible():
+                                    submit.click(timeout=5000)
+                                    page.wait_for_timeout(1500)
+                                    login_resubmitted_after_challenge = True
+                            except Exception:
+                                pass
+                        page.wait_for_timeout(1000)
+
+                    log.error("Manual verification was not completed successfully within 3 minutes.")
+                    return False
                 err_locs = page.locator(".server-err, .err, [class*='error-msg'], .login-error, .cntErr").all_inner_texts()
                 clean_errs = [e.strip() for e in err_locs if e.strip()]
                 if clean_errs:
+                    self.stop_retries = True
                     log.error(f"Login error on page: {' | '.join(clean_errs)}")
                     self._save_diagnostics(page, "login_error_text")
                     return False
@@ -497,28 +534,59 @@ class NaukriUpdater:
             return True
 
         try:
-            file_input = page.locator("input[type='file']").first
+            # Naukri also has a profile-photo file input earlier in the DOM.
+            # Target the resume control explicitly to avoid selecting the photo input.
+            file_input = page.locator(
+                "#attachCV, input[type='file'][aria-label='Upload resume']"
+            ).first
             if file_input.count() == 0:
-                page.locator("button:has-text('Update resume'), a:has-text('Update resume'), label:has-text('Update resume')").first.click()
-                page.wait_for_timeout(1000)
-                file_input = page.locator("input[type='file']").first
-
-            file_input.set_input_files(str(resume_file))
-            log.info("Resume file selected, waiting for upload to complete...")
-            page.wait_for_timeout(5000)
-
-            # Robust confirmation verification
-            try:
-                success_loc = page.locator(
-                    ".toast-success, [class*='success'], :has-text('successfully uploaded'), :has-text('Resume updated')"
+                update_control = page.locator(
+                    "input.dummyUpload[value='Update resume'], button:has-text('Update resume'), "
+                    "a:has-text('Update resume'), label:has-text('Update resume')"
                 ).first
-                if success_loc.is_visible(timeout=5000):
-                    log.info("Resume uploaded successfully!")
-                else:
-                    log.info("Resume upload submitted.")
-            except Exception:
-                log.info("Resume upload submitted.")
+                update_control.wait_for(state="visible", timeout=5000)
+                update_control.click()
+                page.wait_for_timeout(1000)
+                file_input = page.locator(
+                    "#attachCV, input[type='file'][aria-label='Upload resume']"
+                ).first
 
+            if file_input.count() == 0:
+                raise RuntimeError("Naukri did not expose a resume file input after opening Update resume.")
+
+            # Follow Naukri's visible control first: it opens the resume file
+            # chooser and may perform setup that direct input assignment skips.
+            upload_button = page.locator("input.dummyUpload[value='Update resume']").first
+            selected = False
+            if upload_button.count() and upload_button.is_visible():
+                try:
+                    with page.expect_file_chooser(timeout=4000) as chooser_info:
+                        upload_button.click(timeout=5000)
+                    chooser_info.value.set_files(str(resume_file))
+                    selected = True
+                except PlaywrightTimeoutError:
+                    log.debug("Update resume control did not open a chooser; assigning the resume input directly.")
+
+            if not selected:
+                file_input.set_input_files(str(resume_file))
+            log.info("Resume file selected, waiting for upload to complete...")
+            # Naukri reports the result in #attachCVMsgBox, not the older
+            # .resumeAttachSuccessToast class. Require its success message and
+            # verify the filename displayed in the resume card.
+            upload_message = page.locator("#attachCVMsgBox .msgBox.success .msg").first
+            upload_message.wait_for(state="visible", timeout=25_000)
+            message_text = upload_message.inner_text().strip()
+            if not re.search(r"resume.*successfully uploaded", message_text, re.I):
+                log.error(f"Unexpected Naukri resume upload status: {message_text[:160]}")
+                self._save_diagnostics(page, "resume_upload_unverified")
+                return False
+
+            displayed_filename = page.locator("#lazyAttachCV .resume-name-inline").inner_text().strip()
+            if displayed_filename != resume_file.name:
+                log.error("Naukri confirmed an upload, but the profile filename does not match the selected resume.")
+                self._save_diagnostics(page, "resume_upload_filename_mismatch")
+                return False
+            log.info("Resume upload verified from Naukri's success message and profile filename.")
             return True
 
         except Exception as e:
@@ -589,32 +657,59 @@ class NaukriUpdater:
         log.info("Saving headline...")
         saved_with_button = False
         try:
-            save_btn = page.locator("button.btn-dark-ot").filter(has_text="Save").first
-            if save_btn.is_visible(timeout=2000):
-                save_btn.click(timeout=5000)
-                saved_with_button = True
+            save_buttons = page.get_by_role("button", name=re.compile(r"^\s*save\s*$", re.I))
+            for index in range(save_buttons.count() - 1, -1, -1):
+                save_btn = save_buttons.nth(index)
+                if save_btn.is_visible():
+                    save_btn.click(timeout=5000)
+                    saved_with_button = True
+                    break
         except Exception:
             pass
 
         if not saved_with_button:
-            log.info("Using keyboard fallback to save (Tab + Enter)...")
-            page.keyboard.press("Tab")
-            page.keyboard.press("Enter")
+            log.error("Could not find a visible Save button for the headline editor.")
+            self._save_diagnostics(page, "headline_save_button_not_found")
+            return False
 
-        page.wait_for_timeout(2000)
+        try:
+            textarea.wait_for(state="hidden", timeout=10_000)
+            # Naukri's success/upsell dialog is an explicit server confirmation.
+            # Treat it as authoritative instead of trying to click the editor
+            # underneath the blocking dialog and repeating an already-saved update.
+            success_text = page.locator(".profile-updated-container .success-text")
+            if success_text.is_visible(timeout=1500) and re.search(
+                r"profile updated successfully", success_text.inner_text(), re.I
+            ):
+                state = load_state()
+                state["last_variant"] = "A" if state.get("last_variant", "B") == "B" else "B"
+                save_state(state)
+                log.info("Headline update confirmed by Naukri's 'Profile updated successfully' message.")
+                return True
 
-        # Confirm save: either textarea is closed, or success toast is present
-        still_open = page.locator("#resumeHeadlineTxt").count() > 0
-        if not still_open:
-            log.info("Headline saved! Profile 'last updated' timestamp refreshed.")
-        else:
-            toast = page.locator(".toast-success, [class*='successToast'], [class*='success-toast']")
-            if toast.count() > 0:
-                log.info("Headline saved (toast confirmed)!")
-            else:
-                log.warning("Save may not have completed. Please verify manually.")
-                self._save_diagnostics(page, "save_uncertain")
+            # Naukri displays a success/pro upsell modal after saving. Close it
+            # before attempting the read-back edit click, which it otherwise blocks.
+            success_modal = page.locator(".profileEditDrawer.profileUpdatedProLayer")
+            modal_close = success_modal.locator("[aria-label='Close']").first
+            if modal_close.is_visible(timeout=1500):
+                modal_close.click(timeout=3000, force=True)
+            success_modal.wait_for(state="hidden", timeout=5000)
+            page.wait_for_timeout(300)
+            page.locator("xpath=//span[text()='Resume headline']/following-sibling::span[contains(@class,'edit')]").click(timeout=5000)
+            textarea.wait_for(state="visible", timeout=8000)
+            if textarea.input_value().strip() != new_headline.strip():
+                log.error("Naukri did not persist the requested headline; read-back differs.")
+                self._save_diagnostics(page, "headline_readback_mismatch")
                 return False
+        except Exception as exc:
+            log.error(f"Could not verify the saved headline from Naukri: {exc}")
+            self._save_diagnostics(page, "headline_readback_failed")
+            return False
+
+        state = load_state()
+        state["last_variant"] = "A" if state.get("last_variant", "B") == "B" else "B"
+        save_state(state)
+        log.info("Headline save verified by reading it back from Naukri.")
 
         return True
 
@@ -648,12 +743,15 @@ def run_production(args) -> bool:
 
     # Apply random jitter if configured (e.g. for scheduler runs)
     if RANDOM_JITTER_MAX_SEC > 0 and not args.dry_run:
-        jitter = random.randint(5, RANDOM_JITTER_MAX_SEC)
-        log.info(f"Applying anti-bot schedule jitter: waiting {jitter}s before execution...")
+        jitter = random.randint(0, RANDOM_JITTER_MAX_SEC)
+        log.info(f"Applying configured startup jitter: waiting {jitter}s before execution...")
         time.sleep(jitter)
 
     headless = HEADLESS_ENV and not args.visible
     max_retries = args.retries if args.retries is not None else MAX_RETRIES_ENV
+    if max_retries < 1:
+        log.error("Retry count must be at least 1.")
+        return False
     retry_delay = RETRY_DELAY_SEC_ENV
 
     updater = NaukriUpdater(
@@ -664,11 +762,27 @@ def run_production(args) -> bool:
         resume_path=args.resume_path,
     )
 
+    if (args.skip_resume and args.skip_headline) or (args.skip_headline and not updater.resume_path):
+        log.error("No update action selected. Configure a resume path or enable the headline update.")
+        return False
+
     success = False
+    attempts_used = 0
     for attempt in range(1, max_retries + 1):
-        success = updater.execute_single_attempt(attempt_num=attempt)
+        attempts_used = attempt
+        try:
+            success = updater.execute_single_attempt(attempt_num=attempt)
+        except Exception as exc:
+            log.error(f"Attempt {attempt} could not start or complete: {exc}", exc_info=True)
+            success = False
         if success:
             log.info(f"Update succeeded on attempt {attempt}.")
+            break
+        elif updater.interactive_verification_required or updater.stop_retries:
+            if updater.interactive_verification_required:
+                log.error("Stopping retries because an interactive verification challenge needs your attention.")
+            else:
+                log.error("Stopping retries because this failure cannot be fixed by retrying.")
             break
         elif attempt < max_retries:
             log.warning(f"Attempt {attempt} failed. Retrying in {retry_delay} seconds...")
@@ -676,17 +790,25 @@ def run_production(args) -> bool:
             retry_delay *= 2  # Exponential backoff
 
     if success:
+        if args.dry_run:
+            log.info("Dry run completed. No profile changes were saved.")
+            return True
         log.info("Naukri Profile Auto-Updater completed successfully.")
         send_windows_notification(
             title="Naukri Profile Updater",
-            message="Your Naukri profile headline and timestamp were refreshed successfully!",
+            message="All requested Naukri profile updates were verified successfully.",
         )
         return True
     else:
-        log.error(f"All {max_retries} attempts failed. Please review the logs and screenshots above.")
+        if not args.dry_run:
+            state = load_state()
+            state["last_attempt"] = datetime.now().isoformat()
+            state["last_status"] = "PARTIAL" if updater.resume_completed or updater.headline_completed else "FAILED"
+            save_state(state)
+        log.error(f"Update did not complete after {attempts_used} attempt(s). Review the logs and screenshots above.")
         send_windows_notification(
             title="Naukri Updater Alert",
-            message=f"Profile update failed after {max_retries} attempts. Check screenshots/ and logs/ for details.",
+            message=f"Profile update did not complete after {attempts_used} attempt(s). Check logs/ for details.",
             is_error=True,
         )
         return False
