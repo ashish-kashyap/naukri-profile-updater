@@ -25,6 +25,9 @@ import random
 import logging
 import argparse
 import subprocess
+import imaplib
+import email
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -63,10 +66,33 @@ if not RESUME_PATH_ENV and RESUME_BASE64_ENV:
         RESUME_PATH_ENV = str(resume_cloud_file)
     except Exception as exc:
         pass
+
+# Fallback: check if resume.pdf exists in the repository root (e.g. for private repos)
+if not RESUME_PATH_ENV:
+    for default_resume in [BASE_DIR / "resume.pdf", BASE_DIR / "resume.docx"]:
+        if default_resume.exists():
+            RESUME_PATH_ENV = str(default_resume)
+            break
+
 MAX_RETRIES_ENV = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY_SEC_ENV = int(os.getenv("RETRY_DELAY_SEC", "15"))
 RANDOM_JITTER_MAX_SEC = int(os.getenv("RANDOM_JITTER_MAX_SEC", "0"))
 SEND_NOTIFICATIONS = os.getenv("SEND_NOTIFICATIONS", "true").lower() == "true"
+
+# Automated Email OTP Reader settings (for foreign cloud runners / new location challenges)
+EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "").strip().replace(" ", "")
+EMAIL_USER = os.getenv("EMAIL_USER", "").strip() or EMAIL
+EMAIL_HOST = os.getenv("EMAIL_HOST", "").strip()
+
+if not EMAIL_HOST:
+    if "@gmail.com" in EMAIL_USER.lower():
+        EMAIL_HOST = "imap.gmail.com"
+    elif any(d in EMAIL_USER.lower() for d in ["@outlook.com", "@hotmail.com", "@live.com"]):
+        EMAIL_HOST = "outlook.office365.com"
+    elif "@yahoo.com" in EMAIL_USER.lower():
+        EMAIL_HOST = "imap.mail.yahoo.com"
+    else:
+        EMAIL_HOST = "imap.gmail.com"
 
 NAUKRI_LOGIN_URL = "https://www.naukri.com/nlogin/login"
 NAUKRI_PROFILE_URL = "https://www.naukri.com/mnjuser/profile"
@@ -144,6 +170,81 @@ def write_github_summary(title: str, details: dict, success: bool):
             f.write("\n".join(lines) + "\n")
     except Exception:
         pass
+
+
+def fetch_naukri_otp(email_user: str, email_password: str, host: str, timeout_sec: int = 75) -> str | None:
+    """Connects to IMAP server and retrieves the latest 4-6 digit OTP sent by Naukri."""
+    log.info(f"Connecting to {host} as {email_user} to fetch Naukri OTP...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout_sec:
+        mail = None
+        try:
+            mail = imaplib.IMAP4_SSL(host)
+            mail.login(email_user, email_password)
+            mail.select("INBOX")
+
+            # Search recent emails
+            status, messages = mail.search(None, "ALL")
+            if status == "OK" and messages[0]:
+                msg_ids = messages[0].split()
+                # Examine the most recent 5 emails in reverse chronological order
+                for msg_id in reversed(msg_ids[-5:]):
+                    res, msg_data = mail.fetch(msg_id, "(RFC822)")
+                    for part in msg_data:
+                        if isinstance(part, tuple):
+                            msg = email.message_from_bytes(part[1])
+                            from_hdr = str(msg.get("From", "")).lower()
+                            subj_hdr = str(msg.get("Subject", "")).lower()
+
+                            # Check if email is from Naukri or mentions OTP / verification
+                            if "naukri" in from_hdr or "naukri" in subj_hdr or "otp" in subj_hdr or "verification" in subj_hdr:
+                                # Extract email body text
+                                body = ""
+                                if msg.is_multipart():
+                                    for p in msg.walk():
+                                        if p.get_content_type() in ["text/plain", "text/html"]:
+                                            payload = p.get_payload(decode=True)
+                                            if payload:
+                                                body += payload.decode(errors="ignore")
+                                else:
+                                    payload = msg.get_payload(decode=True)
+                                    if payload:
+                                        body = payload.decode(errors="ignore")
+
+                                # Search for OTP patterns: e.g. "OTP is 123456", "code is: 1234", "<b>123456</b>", or 6/4 digits
+                                patterns = [
+                                    r"(?:otp|verification code|code)\s*(?:is|:)?\s*<b>?(\d{4,6})</b>?",
+                                    r"<b>(\d{4,6})</b>",
+                                    r"\b(\d{6})\b",
+                                    r"\b(\d{4})\b",
+                                ]
+                                for pat in patterns:
+                                    matches = re.findall(pat, body, re.IGNORECASE)
+                                    if matches:
+                                        # Avoid matching current year like 2026
+                                        valid = [m for m in matches if m not in ["2024", "2025", "2026", "2027"]]
+                                        if valid:
+                                            otp = valid[0]
+                                            log.info(f"Successfully retrieved Naukri OTP from email: {otp}")
+                                            try:
+                                                mail.logout()
+                                            except Exception:
+                                                pass
+                                            return otp
+            mail.logout()
+        except Exception as e:
+            log.debug(f"IMAP check attempt notice: {e}")
+            if mail:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+
+        time.sleep(4)
+
+    log.error(f"Timed out after {timeout_sec}s waiting for Naukri OTP email.")
+    return None
 
 
 def clean_old_artifacts(days: int = 14):
@@ -409,17 +510,122 @@ class NaukriUpdater:
             self._save_diagnostics(page, "login_btn_error")
             return False
 
-        # Wait for post-login redirect
+        # Wait for post-login redirect OR OTP challenge
+        log.info("Waiting for login result (redirect or OTP challenge)...")
+        start_wait = time.time()
+        while time.time() - start_wait < 25:
+            # 1. Success check: redirected to profile / home
+            if "mnjuser" in page.url or ("naukri.com" in page.url and "nlogin" not in page.url):
+                log.info("Login successful (redirected)!")
+                return True
+
+            # 2. Check for OTP inputs
+            otp_selectors = [
+                "input[placeholder*='OTP' i]",
+                "input[name*='otp' i]",
+                "input[id*='otp' i]",
+                "input[class*='otp' i]",
+                "input[maxlength='6']",
+                "input[maxlength='1']",
+            ]
+            for sel in otp_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible():
+                        log.info(f"Detected OTP challenge on login page ({sel}).")
+                        return self._handle_otp_challenge(page)
+                except Exception:
+                    pass
+
+            # 3. Check for OTP text on page
+            try:
+                otp_text = page.locator("text='Enter OTP', text='Verification Code', text='verify with OTP', text='Enter verification code'").first
+                if otp_text.is_visible():
+                    log.info("Detected OTP challenge text on login page.")
+                    return self._handle_otp_challenge(page)
+            except Exception:
+                pass
+
+            # 4. Check for credential errors
+            try:
+                err_locs = page.locator(".server-err, .err, [class*='error-msg'], .login-error, .cntErr").all_inner_texts()
+                clean_errs = [e.strip() for e in err_locs if e.strip()]
+                if clean_errs:
+                    log.error(f"Login error displayed on page: {' | '.join(clean_errs)}")
+                    self._save_diagnostics(page, "login_error_text")
+                    return False
+            except Exception:
+                pass
+
+            page.wait_for_timeout(1000)
+
+        log.error(f"Login timed out. Current URL: {page.url}")
+        self._save_diagnostics(page, "login_failed")
+        return False
+
+    def _handle_otp_challenge(self, page) -> bool:
+        """Automatically reads the OTP from email via IMAP and completes login."""
+        log.info("Naukri triggered an OTP verification challenge.")
+        if not EMAIL_APP_PASSWORD:
+            log.error(
+                "Naukri requires OTP verification, but EMAIL_APP_PASSWORD is not set in environment or GitHub Secrets! "
+                "Please configure EMAIL_APP_PASSWORD (e.g. 16-character Google App Password) to allow automatic OTP login."
+            )
+            self._save_diagnostics(page, "otp_prompt_no_password")
+            return False
+
+        log.info("Waiting for OTP email from Naukri and reading via IMAP...")
+        email_to_check = EMAIL_USER or EMAIL
+        otp_code = fetch_naukri_otp(email_to_check, EMAIL_APP_PASSWORD, EMAIL_HOST)
+
+        if not otp_code:
+            log.error("Could not fetch OTP from email.")
+            self._save_diagnostics(page, "otp_fetch_failed")
+            return False
+
+        log.info(f"Submitting OTP code ({otp_code}) into login form...")
         try:
+            # Check for multi-input individual digit boxes (e.g. 6 separate boxes)
+            digit_inputs = page.locator("input[maxlength='1']")
+            if digit_inputs.count() >= len(otp_code):
+                log.info("Filling multi-box individual digit inputs...")
+                for idx, ch in enumerate(otp_code):
+                    digit_inputs.nth(idx).fill(ch)
+                    page.wait_for_timeout(100)
+            else:
+                # Single OTP input field
+                otp_field = page.locator(
+                    "input[placeholder*='OTP' i], input[name*='otp' i], input[id*='otp' i], input[class*='otp' i], input[maxlength='6'], input[type='tel'], input[type='number']"
+                ).first
+                otp_field.click()
+                page.wait_for_timeout(200)
+                otp_field.fill(otp_code)
+
+            page.wait_for_timeout(500)
+
+            # Click submit/verify button
+            verify_btn = page.locator(
+                "button:has-text('Verify'), button:has-text('Submit'), button[type='submit'], button:has-text('Continue'), .btn-dark-ot"
+            ).first
+            if verify_btn.is_visible(timeout=3000):
+                verify_btn.click()
+            else:
+                page.keyboard.press("Enter")
+
+            # Wait for redirect after OTP submission
             page.wait_for_url("**/mnjuser/**", timeout=25_000)
-            log.info("Login successful!")
+            log.info("OTP verification successful! Logged in.")
             return True
         except PlaywrightTimeoutError:
             if "naukri.com" in page.url and "nlogin" not in page.url:
-                log.info("Login successful (redirected)!")
+                log.info("OTP verification successful (redirected)!")
                 return True
-            log.error(f"Login failed. Current URL: {page.url}")
-            self._save_diagnostics(page, "login_failed")
+            log.error(f"OTP verification failed or timed out. Current URL: {page.url}")
+            self._save_diagnostics(page, "otp_verification_failed")
+            return False
+        except Exception as e:
+            log.error(f"Failed to submit OTP: {e}")
+            self._save_diagnostics(page, "otp_submit_error")
             return False
 
     # ------------------------------------------------------------------

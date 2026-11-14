@@ -52,6 +52,9 @@ jobs:
         env:
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
           RESUME_BASE64: ${{ secrets.RESUME_BASE64 }}
           HEADLINE_VARIANT_A: ${{ secrets.HEADLINE_VARIANT_A }}
           HEADLINE_VARIANT_B: ${{ secrets.HEADLINE_VARIANT_B }}

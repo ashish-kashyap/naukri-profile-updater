@@ -22,9 +22,17 @@ In your forked repo, go to **Settings** → **Secrets and variables** → **Acti
 |---|---|---|
 | `NAUKRI_EMAIL` | **Yes** | Your Naukri login email or mobile number |
 | `NAUKRI_PASSWORD` | **Yes** | Your Naukri password |
+| `EMAIL_APP_PASSWORD` | **Recommended for Cloud** | 16-character App Password to auto-read Naukri OTP (see below) |
 | `RESUME_BASE64` | *Optional* | Your resume file encoded in Base64 (see below) |
 | `HEADLINE_VARIANT_A`| *Optional* | Custom headline variant 1 |
 | `HEADLINE_VARIANT_B`| *Optional* | Custom headline variant 2 |
+
+> **Why `EMAIL_APP_PASSWORD` is needed for Cloud Automation:**  
+> When logging in from Microsoft Azure's cloud datacenter (US), Naukri triggers an **email OTP security challenge**. The script automatically connects to your inbox via IMAP, retrieves the 6-digit OTP code in real time, and logs in!  
+> **How to create a free Google App Password (takes 30 seconds):**  
+> 1. Go to your [Google Account App Passwords](https://myaccount.google.com/apppasswords) (Make sure 2-Step Verification is turned on).  
+> 2. App name: enter `Naukri Bot` → click **Create**.  
+> 3. Copy the 16-character code (e.g. `abcd efgh ijkl mnop`) and save it as the **`EMAIL_APP_PASSWORD`** secret.
 
 > **How to get your resume in Base64 (Optional):**  
 > Run this one-line command in PowerShell to copy your resume directly to your clipboard:  
