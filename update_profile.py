@@ -370,12 +370,15 @@ class NaukriUpdater:
                     "--start-maximized",
                 ])
 
+            # In GitHub Actions (CI), use true headless. Outside CI, use headed
+            # (with offscreen window position) to avoid Akamai bot-detection.
+            is_ci = os.getenv("GITHUB_ACTIONS") == "true"
             launch_kwargs = {
-                "headless": False,  # Always headed under the hood so Akamai never sees headless-shell
+                "headless": is_ci,   # True headless in CI (no display), headed locally
                 "slow_mo": 50,
                 "args": browser_args,
             }
-            if channel:
+            if channel and not is_ci:
                 launch_kwargs["channel"] = channel
 
             browser = pw.chromium.launch(**launch_kwargs)
@@ -511,15 +514,29 @@ class NaukriUpdater:
             return False
 
         # Wait for post-login redirect OR OTP challenge
+        # Increased to 50s to allow time for OTP page redirect on foreign cloud IPs
         log.info("Waiting for login result (redirect or OTP challenge)...")
         start_wait = time.time()
-        while time.time() - start_wait < 25:
+        wait_limit = 50
+        while time.time() - start_wait < wait_limit:
+            current_url = page.url
+            log.debug(f"[login-wait] URL={current_url}")
+
             # 1. Success check: redirected to profile / home
-            if "mnjuser" in page.url or ("naukri.com" in page.url and "nlogin" not in page.url):
+            if "mnjuser" in current_url or (
+                "naukri.com" in current_url
+                and "nlogin" not in current_url
+                and "otp" not in current_url.lower()
+            ):
                 log.info("Login successful (redirected)!")
                 return True
 
-            # 2. Check for OTP inputs
+            # 2. URL-based OTP page detection (Naukri redirects to /nlogin/otp or similar)
+            if "otp" in current_url.lower() or "verify" in current_url.lower():
+                log.info(f"Detected OTP challenge page via URL: {current_url}")
+                return self._handle_otp_challenge(page)
+
+            # 3. Check for OTP inputs
             otp_selectors = [
                 "input[placeholder*='OTP' i]",
                 "input[name*='otp' i]",
@@ -531,22 +548,24 @@ class NaukriUpdater:
             for sel in otp_selectors:
                 try:
                     loc = page.locator(sel).first
-                    if loc.is_visible():
-                        log.info(f"Detected OTP challenge on login page ({sel}).")
+                    if loc.is_visible(timeout=500):
+                        log.info(f"Detected OTP input field ({sel}).")
                         return self._handle_otp_challenge(page)
                 except Exception:
                     pass
 
-            # 3. Check for OTP text on page
+            # 4. Check for OTP text on page (broader match)
             try:
-                otp_text = page.locator("text='Enter OTP', text='Verification Code', text='verify with OTP', text='Enter verification code'").first
-                if otp_text.is_visible():
-                    log.info("Detected OTP challenge text on login page.")
+                page_text = page.inner_text("body")
+                otp_keywords = ["enter otp", "verification code", "verify with otp",
+                                "enter verification code", "otp sent", "one-time password"]
+                if any(kw in page_text.lower() for kw in otp_keywords):
+                    log.info("Detected OTP challenge text in page body.")
                     return self._handle_otp_challenge(page)
             except Exception:
                 pass
 
-            # 4. Check for credential errors
+            # 5. Check for credential errors
             try:
                 err_locs = page.locator(".server-err, .err, [class*='error-msg'], .login-error, .cntErr").all_inner_texts()
                 clean_errs = [e.strip() for e in err_locs if e.strip()]
@@ -559,7 +578,7 @@ class NaukriUpdater:
 
             page.wait_for_timeout(1000)
 
-        log.error(f"Login timed out. Current URL: {page.url}")
+        log.error(f"Login timed out after {wait_limit}s. Current URL: {page.url}")
         self._save_diagnostics(page, "login_failed")
         return False
 
@@ -576,7 +595,8 @@ class NaukriUpdater:
 
         log.info("Waiting for OTP email from Naukri and reading via IMAP...")
         email_to_check = EMAIL_USER or EMAIL
-        otp_code = fetch_naukri_otp(email_to_check, EMAIL_APP_PASSWORD, EMAIL_HOST)
+        otp_timeout = int(os.getenv("OTP_TIMEOUT_SEC", "120"))
+        otp_code = fetch_naukri_otp(email_to_check, EMAIL_APP_PASSWORD, EMAIL_HOST, timeout_sec=otp_timeout)
 
         if not otp_code:
             log.error("Could not fetch OTP from email.")

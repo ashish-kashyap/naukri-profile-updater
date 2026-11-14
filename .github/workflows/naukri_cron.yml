@@ -60,6 +60,7 @@ jobs:
           HEADLINE_VARIANT_B: ${{ secrets.HEADLINE_VARIANT_B }}
           HEADLESS: 'true'
           SEND_NOTIFICATIONS: 'false'
+          OTP_TIMEOUT_SEC: '120'
         run: |
           $extraArgs = @()
           if ('${{ github.event.inputs.dry_run }}' -eq 'true') { $extraArgs += '--dry-run' }
