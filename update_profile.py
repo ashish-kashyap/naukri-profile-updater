@@ -370,11 +370,12 @@ class NaukriUpdater:
                     "--start-maximized",
                 ])
 
-            # In GitHub Actions (CI), use true headless. Outside CI, use headed
-            # (with offscreen window position) to avoid Akamai bot-detection.
+            # In GitHub Actions, Xvfb provides a virtual X11 display so we can
+            # run Chrome in headed mode (headless=False) everywhere — this is the
+            # only reliable way to avoid Naukri's Akamai CDN bot-detection.
             is_ci = os.getenv("GITHUB_ACTIONS") == "true"
             launch_kwargs = {
-                "headless": is_ci,   # True headless in CI (no display), headed locally
+                "headless": False,  # Always headed — Akamai blocks headless-shell
                 "slow_mo": 50,
                 "args": browser_args,
             }

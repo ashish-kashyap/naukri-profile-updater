@@ -29,7 +29,7 @@ concurrency:
 jobs:
   update_profile:
     name: Refresh Naukri Profile
-    runs-on: windows-latest
+    runs-on: ubuntu-latest        # Linux + Xvfb = headed Chrome without a real monitor
     timeout-minutes: 15
 
     steps:
@@ -42,11 +42,20 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install dependencies & system libs
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           playwright install chromium
+          playwright install-deps chromium
+
+      - name: Start Xvfb virtual display
+        # Xvfb provides a headless X11 display so Chrome can run in headed mode
+        # without a physical monitor — bypassing Naukri's CDN bot detection.
+        run: |
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1366x768x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
 
       - name: Run Naukri Profile Updater
         env:
@@ -58,15 +67,16 @@ jobs:
           RESUME_BASE64: ${{ secrets.RESUME_BASE64 }}
           HEADLINE_VARIANT_A: ${{ secrets.HEADLINE_VARIANT_A }}
           HEADLINE_VARIANT_B: ${{ secrets.HEADLINE_VARIANT_B }}
-          HEADLESS: 'true'
+          HEADLESS: 'false'       # Headed mode — Akamai cannot detect this as a bot
           SEND_NOTIFICATIONS: 'false'
           OTP_TIMEOUT_SEC: '120'
+          DISPLAY: ':99'          # Point Chrome at the Xvfb virtual display
         run: |
-          $extraArgs = @()
-          if ('${{ github.event.inputs.dry_run }}' -eq 'true') { $extraArgs += '--dry-run' }
-          if ('${{ github.event.inputs.skip_resume }}' -eq 'true') { $extraArgs += '--skip-resume' }
-          if ('${{ github.event.inputs.skip_headline }}' -eq 'true') { $extraArgs += '--skip-headline' }
-          python update_profile.py $extraArgs
+          extra_args=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then extra_args="$extra_args --dry-run"; fi
+          if [ "${{ github.event.inputs.skip_resume }}" = "true" ]; then extra_args="$extra_args --skip-resume"; fi
+          if [ "${{ github.event.inputs.skip_headline }}" = "true" ]; then extra_args="$extra_args --skip-headline"; fi
+          python update_profile.py $extra_args
 
       - name: Upload Logs & Debug Artifacts on Failure
         if: failure()
