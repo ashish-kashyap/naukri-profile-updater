@@ -52,6 +52,17 @@ ACTION_DELAY_MS = int(os.getenv("ACTION_DELAY_MS", "1500"))
 HEADLINE_A = os.getenv("HEADLINE_VARIANT_A", "").strip()
 HEADLINE_B = os.getenv("HEADLINE_VARIANT_B", "").strip()
 RESUME_PATH_ENV = os.getenv("RESUME_PATH", "").strip().strip('"').strip("'")
+RESUME_BASE64_ENV = os.getenv("RESUME_BASE64", "").strip()
+
+# If running in cloud/CI with RESUME_BASE64 secret, decode to a local file
+if not RESUME_PATH_ENV and RESUME_BASE64_ENV:
+    import base64
+    resume_cloud_file = BASE_DIR / "resume_cloud.pdf"
+    try:
+        resume_cloud_file.write_bytes(base64.b64decode(RESUME_BASE64_ENV))
+        RESUME_PATH_ENV = str(resume_cloud_file)
+    except Exception as exc:
+        pass
 MAX_RETRIES_ENV = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY_SEC_ENV = int(os.getenv("RETRY_DELAY_SEC", "15"))
 RANDOM_JITTER_MAX_SEC = int(os.getenv("RANDOM_JITTER_MAX_SEC", "0"))
@@ -88,8 +99,8 @@ log = logging.getLogger("naukri-updater")
 # ---------------------------------------------------------------------------
 
 def send_windows_notification(title: str, message: str, is_error: bool = False):
-    """Sends a native Windows Toast notification if enabled."""
-    if not SEND_NOTIFICATIONS:
+    """Sends a native Windows Toast notification if enabled and not running in CI."""
+    if not SEND_NOTIFICATIONS or os.getenv("GITHUB_ACTIONS") == "true":
         return
     try:
         # Use PowerShell to trigger a modern Windows Notification toast
@@ -109,6 +120,28 @@ def send_windows_notification(title: str, message: str, is_error: bool = False):
             capture_output=True,
             timeout=5,
         )
+    except Exception:
+        pass
+
+
+def write_github_summary(title: str, details: dict, success: bool):
+    """Appends Markdown job summary for GitHub Actions if running in CI."""
+    summary_file = os.getenv("GITHUB_STEP_SUMMARY")
+    if not summary_file:
+        return
+    try:
+        badge = "Status: **SUCCESS**" if success else "Status: **FAILED**"
+        lines = [
+            f"### {title} - {badge}\n",
+            "| Field | Detail |",
+            "|---|---|",
+        ]
+        for k, v in details.items():
+            lines.append(f"| {k} | {v} |")
+        lines.append(f"| Completed At | {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} |")
+        lines.append("")
+        with open(summary_file, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
     except Exception:
         pass
 
@@ -594,6 +627,15 @@ def run_production(args) -> bool:
             title="Naukri Profile Updater",
             message="Your Naukri profile headline and timestamp were refreshed successfully!",
         )
+        write_github_summary(
+            "Naukri Profile Update",
+            {
+                "Mode": "DRY RUN" if args.dry_run else "LIVE",
+                "Resume Upload": "Skipped" if args.skip_resume or not updater.resume_path else "Uploaded",
+                "Headline Refresh": "Skipped" if args.skip_headline else "Updated & Saved",
+            },
+            success=True,
+        )
         return True
     else:
         log.error(f"All {max_retries} attempts failed. Please review the logs and screenshots above.")
@@ -601,6 +643,15 @@ def run_production(args) -> bool:
             title="Naukri Updater Alert",
             message=f"Profile update failed after {max_retries} attempts. Check screenshots/ and logs/ for details.",
             is_error=True,
+        )
+        write_github_summary(
+            "Naukri Profile Update",
+            {
+                "Mode": "DRY RUN" if args.dry_run else "LIVE",
+                "Attempts Made": f"{max_retries}",
+                "Error": "Check uploaded artifacts/logs for details",
+            },
+            success=False,
         )
         return False
 
